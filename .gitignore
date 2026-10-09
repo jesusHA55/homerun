@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Firmware build
+firmware/.pio/
+firmware/*/.pio/
+
+# Environment
+.env
+
+# Runtime data
+data/*.db
+data/*.db-journal
+data/snapshots/
+data/clips/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
