@@ -111,6 +111,29 @@ ollama serve
 - `docs/wiring.md` — pin map and power/water safety notes.
 - `docs/protocol.md` — Pi ⇄ Mega serial protocol reference.
 
+## Running on the Pi (autostart)
+
+```bash
+sudo apt install -y python3-picamera2   # camera stack (apt only)
+scripts/setup.sh                        # venv (+ system site-packages), .env
+scripts/install-service.sh              # systemd unit, enabled on boot
+journalctl -u homerun-backend -f        # logs
+```
+
+The UI is served at `http://<pi>:8000`. The Pi needs `camera_auto_detect=1`
+in `/boot/firmware/config.txt`. If Node isn't installed on the Pi, run
+`npm run build` elsewhere and copy `frontend/dist/` across.
+
+## Open points
+
+- **Auth token:** the API is open while `HOMERUN_AUTH_TOKEN=change-me`. Setting
+  a real token currently breaks the camera view (`<img>` can't send the
+  header), and the WebSocket isn't authenticated at all. Fix this before
+  exposing the Pi beyond the home network.
+- **Watering:** to be simplified to a plain on/off signal on a weekly schedule.
+  The current firmware's tank-level maths always reads 0%, which blocks every
+  watering run.
+
 ## Safety
 
 Water and mains-powered switching are involved. Read `docs/wiring.md` before

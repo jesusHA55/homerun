@@ -131,6 +131,7 @@ class SerialManager:
     # --- internals ---------------------------------------------------------
     async def _connect_loop(self) -> None:
         assert serial_asyncio is not None
+        last_error: Optional[str] = None
         while True:
             try:
                 reader, writer = await serial_asyncio.open_serial_connection(
@@ -138,13 +139,18 @@ class SerialManager:
                 )
                 self._reader, self._writer = reader, writer
                 self._connected = True
+                last_error = None
                 log.info("serial connected on %s", self.settings.serial_port)
                 await self._read_loop(reader)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self._connected = False
-                log.warning("serial unavailable (%s); retrying", exc)
+                # Log once per distinct error so an unplugged board doesn't
+                # flood the journal every few seconds.
+                if str(exc) != last_error:
+                    log.warning("serial unavailable (%s); retrying", exc)
+                    last_error = str(exc)
                 await asyncio.sleep(3)
 
     async def _read_loop(self, reader) -> None:

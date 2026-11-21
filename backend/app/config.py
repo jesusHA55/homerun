@@ -1,11 +1,17 @@
 from functools import lru_cache
+from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Repository root (…/Homerun). Relative storage paths resolve against it so the
+# data directory is the same no matter which directory the server starts in.
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="HOMERUN_", env_file=(".env", "../.env"), extra="ignore"
+        env_prefix="HOMERUN_", env_file=(ROOT / ".env",), extra="ignore"
     )
 
     # Server
@@ -42,6 +48,12 @@ class Settings(BaseSettings):
     soil_target: int = 55
     water_max_s: int = 60
     water_min_interval_s: int = 1800
+
+    @field_validator("db_path", "media_dir")
+    @classmethod
+    def _resolve_from_root(cls, value: str) -> str:
+        path = Path(value).expanduser()
+        return str(path if path.is_absolute() else (ROOT / path).resolve())
 
 
 @lru_cache

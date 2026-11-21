@@ -1,19 +1,19 @@
 [Unit]
 Description=Homerun home assistant backend
-After=network-online.target
+After=network-online.target ollama.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Adjust User/WorkingDirectory/EnvironmentFile to your setup.
-User=pi
-WorkingDirectory=/home/pi/Homerun/backend
-EnvironmentFile=/home/pi/Homerun/.env
-ExecStart=/home/pi/Homerun/backend/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Template: scripts/install-service.sh replaces @USER@ and @ROOT@.
+User=@USER@
+WorkingDirectory=@ROOT@/backend
+EnvironmentFile=@ROOT@/.env
+ExecStart=@ROOT@/backend/.venv/bin/uvicorn app.main:app --host ${HOMERUN_HOST} --port ${HOMERUN_PORT}
 Restart=on-failure
 RestartSec=5
 
-# Camera + serial need access to the video/GPIO groups.
+# Camera + serial need access to the video and dialout groups.
 SupplementaryGroups=video dialout
 
 [Install]

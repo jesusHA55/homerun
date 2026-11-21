@@ -3,14 +3,16 @@
 Backends:
   * picamera  - Raspberry Pi Camera Module 3 via picamera2
   * opencv    - USB / built-in camera via cv2.VideoCapture
-  * synthetic - generated frames (dev / no hardware)
-  * auto      - prefer picamera, then opencv, then synthetic
+  * synthetic - generated frames (dev / no hardware); never picked by auto
+  * auto      - a detected Pi camera, else a USB camera that delivers frames,
+                else unavailable (re-probed periodically)
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
@@ -24,6 +26,8 @@ log = logging.getLogger("homerun.camera")
 
 JPEG_BOUNDARY = b"--frame\r\n"
 MODES = ("manual", "motion")
+RETRY_S = 5.0            # re-probe interval while no camera is available
+MAX_READ_FAILURES = 20   # consecutive bad reads before reopening the camera
 
 
 class CameraService:
@@ -92,15 +96,26 @@ class CameraService:
             backend = self._pick_backend()
 
         try:
+            if backend == "none":
+                raise RuntimeError("no camera detected")
             if backend == "picamera":
                 from picamera2 import Picamera2
 
+                if not Picamera2.global_camera_info():
+                    raise RuntimeError("no Pi camera detected (check ribbon cable"
+                                       " and camera_auto_detect in config.txt)")
                 self._picam = Picamera2()
-                config = self._picam.create_preview_configuration(
-                    main={"size": (self.settings.camera_width, self.settings.camera_height)}
+                # RGB888 arrays are laid out B,G,R: exactly what OpenCV expects.
+                config = self._picam.create_video_configuration(
+                    main={"size": (self.settings.camera_width, self.settings.camera_height),
+                          "format": "RGB888"}
                 )
                 self._picam.configure(config)
                 self._picam.start()
+                try:  # Camera Module 3 has autofocus; others ignore this.
+                    self._picam.set_controls({"AfMode": 2})  # continuous
+                except Exception:
+                    pass
                 time.sleep(0.5)
                 self.backend_name = "picamera"
             elif backend == "opencv":
@@ -117,42 +132,44 @@ class CameraService:
             self.available = True
             self.last_error = None
         except Exception as exc:  # noqa: BLE001
-            message = str(exc)
+            message = str(exc) or type(exc).__name__
             if message != self.last_error:
                 log.warning("camera unavailable: %s", message)
+            self._release()
             self.available = False
             self.last_error = message
             self.backend_name = "none"
 
     def _pick_backend(self) -> str:
         try:
-            import picamera2  # noqa: F401
+            from picamera2 import Picamera2
 
-            return "picamera"
+            if Picamera2.global_camera_info():
+                return "picamera"
         except Exception:
             pass
+        # On Linux, skip the probe when the device node is missing: OpenCV logs
+        # a warning on every failed open, which would flood the journal.
+        if sys.platform.startswith("linux") and not Path(
+                f"/dev/video{self.settings.camera_index}").exists():
+            return "none"
         try:
             import cv2
 
+            # isOpened() alone is not enough: on a Pi 5 the ISP nodes open
+            # fine but never deliver frames. Require a real frame.
             cap = cv2.VideoCapture(self.settings.camera_index)
-            ok = cap.isOpened()
+            ok = cap.isOpened() and cap.read()[0]
             cap.release()
             if ok:
                 return "opencv"
         except Exception:
             pass
-        try:
-            import cv2  # noqa: F401
-
-            return "synthetic"
-        except Exception:
-            return "none"
+        return "none"
 
     def _read_frame(self) -> Any:
         if self.backend_name == "picamera" and self._picam is not None:
-            cv2 = self._cv2()
-            array = self._picam.capture_array("main")  # RGB
-            return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+            return self._picam.capture_array("main")  # BGR (RGB888 format)
         if self.backend_name == "opencv" and self._cap is not None:
             ok, frame = self._cap.read()
             return frame if ok else None
@@ -181,19 +198,34 @@ class CameraService:
 
     # --- main loop ---------------------------------------------------------
     async def _loop(self) -> None:
-        self._open()
+        await asyncio.to_thread(self._open)
         interval = 1.0 / 10  # ~10 fps is plenty for monitoring
+        failures = 0
         while True:
             try:
                 if not self.available:
-                    await asyncio.sleep(2)
-                    self._open()
+                    await asyncio.sleep(RETRY_S)
+                    await asyncio.to_thread(self._open)
+                    failures = 0
                     continue
 
-                frame = await asyncio.to_thread(self._read_frame)
+                try:
+                    frame = await asyncio.to_thread(self._read_frame)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("camera read failed: %s", exc)
+                    frame = None
                 if frame is None:
+                    failures += 1
+                    if failures >= MAX_READ_FAILURES:
+                        log.warning("camera stopped delivering frames; reopening")
+                        self._release()
+                        self.available = False
+                        self.backend_name = "none"
+                        self.last_error = "camera stopped delivering frames"
+                        self._jpeg = None
                     await asyncio.sleep(0.2)
                     continue
+                failures = 0
 
                 self._frame = frame
                 jpeg = await asyncio.to_thread(self._encode, frame)
@@ -219,7 +251,7 @@ class CameraService:
 
     async def _on_motion(self, frame: Any) -> None:
         snap = self.save_snapshot("motion")
-        clip = self._start_clip()
+        clip = self._start_clip(frame)
         area = self._detector.last_area
         self.db.add_motion_event(snap, clip, area)
         await self.bus.publish({"type": "motion", "snapshot": snap, "clip": clip,
@@ -248,7 +280,9 @@ class CameraService:
         path.write_bytes(self._jpeg)
         return str(path)
 
-    def _start_clip(self) -> Optional[str]:
+    def _start_clip(self, frame: Any) -> Optional[str]:
+        if self._writer is not None:  # already recording
+            return None
         try:
             cv2 = self._cv2()
         except Exception:
@@ -257,10 +291,8 @@ class CameraService:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"motion_{int(time.time())}.avi"
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(
-            str(path), fourcc, 10.0,
-            (self.settings.camera_width, self.settings.camera_height),
-        )
+        height, width = frame.shape[:2]  # the camera may adjust the requested size
+        writer = cv2.VideoWriter(str(path), fourcc, 10.0, (width, height))
         if not writer.isOpened():
             return None
         self._writer = writer
